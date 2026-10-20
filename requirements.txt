@@ -1,0 +1,8 @@
+Flask
+Flask-Mail
+psycopg[binary]
+python-dotenv
+reportlab
+qrcode
+Pillow
+gunicorn
