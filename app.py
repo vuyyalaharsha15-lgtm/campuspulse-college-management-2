@@ -93,4 +93,15 @@ def send_email(subject, recipient, text_body):
 
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
+
     if not database_url:
+        raise RuntimeError("DATABASE_URL is missing. Set it in Render Environment.")
+
+    sslmode = os.getenv("DB_SSLMODE", "require")
+
+    conn = psycopg.connect(
+        database_url,
+        sslmode=sslmode,
+        row_factory=dict_row
+    )
+    return conn
