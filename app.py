@@ -1,13 +1,16 @@
 from flask import Flask, render_template, request, redirect, url_for, session, send_file
 import psycopg
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from psycopg.rows import dict_row
-from flask_mail import Mail, Message
 from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 import qrcode
 import os
 from dotenv import load_dotenv
+
+load_dotenv()
 
 from datetime import date, datetime, timedelta, timezone
 import random
@@ -19,24 +22,47 @@ if not app.secret_key:
     raise RuntimeError("SECRET_KEY is missing. Set a strong random value in .env.")
 
 # ==========================================
-# EMAIL CONFIGURATION
+# EMAIL CONFIGURATION (RESEND API)
 # ==========================================
 
-app.config["MAIL_SERVER"] = "smtp.gmail.com"
-app.config["MAIL_PORT"] = 587
-app.config["MAIL_USE_TLS"] = True
-app.config["MAIL_USE_SSL"] = False
+def send_email(subject, recipient, text_body):
+    """Send an email using the Resend HTTPS API."""
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "RESEND_API_KEY is missing. Add it in Render Environment."
+        )
 
-app.config["MAIL_USERNAME"] = os.getenv("MAIL_USERNAME", "")
+    sender = os.getenv(
+        "RESEND_FROM_EMAIL",
+        "CampusPulse <onboarding@resend.dev>"
+    )
 
-app.config["MAIL_PASSWORD"] = os.getenv(
-    "MAIL_PASSWORD",
-    ""
-)
+    payload = {
+        "from": sender,
+        "to": [recipient],
+        "subject": subject,
+        "text": text_body,
+    }
 
-app.config["MAIL_DEFAULT_SENDER"] = app.config["MAIL_USERNAME"]
+    req = Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
 
-mail = Mail(app)
+    try:
+        with urlopen(req, timeout=20) as response:
+            response.read()
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(
+            f"Resend API error ({exc.code}): {details}"
+        ) from exc
 
 
 # ==========================================
@@ -126,19 +152,11 @@ def register():
 
         cursor.execute(sql, values)
 
-        conn.commit()
+        # Keep the insert uncommitted until Resend accepts the email.
+        # If email sending fails, rollback so this email can register again.
 
-        cursor.close()
-        conn.close()
-
-        # Send OTP email
-
-        msg = Message(
-            subject="CampusPulse Email Verification",
-            sender=app.config["MAIL_USERNAME"],
-            recipients=[email]
-        )
-        msg.body = f"""
+        # Send OTP email through Resend API
+        email_text = f"""
 Hello {full_name},
 
 Welcome to CampusPulse!
@@ -154,12 +172,39 @@ CampusPulse Team
 """
 
         try:
-            mail.send(msg)
+            send_email(
+                subject="CampusPulse Email Verification",
+                recipient=email,
+                text_body=email_text,
+            )
+        except Exception:
+            # Undo the uncommitted student insert so the user can retry
+            # registration with the same email address.
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            app.logger.exception("Email sending failed")
+            return (
+                "Email could not be sent. Please check the email "
+                "service configuration and try again.",
+                502,
+            )
 
-        except Exception as e:
-            print("Email Sending Failed")
-            print(e)
-            return f"Email Error: {e}"
+        # Commit only after the email API accepted the OTP message.
+        try:
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            cursor.close()
+            conn.close()
+            app.logger.exception("Student registration commit failed")
+            return (
+                "Registration could not be completed. Please try again.",
+                500,
+            )
+
+        cursor.close()
+        conn.close()
 
         session["verify_email"] = email
         return redirect(url_for("verify_email"))
@@ -3148,30 +3193,34 @@ Issue Date : {data['issue_date']}
 
 @app.route("/test_email")
 def test_email():
+    recipient = os.getenv("TEST_EMAIL")
 
-    msg = Message(
-        subject="CampusPulse Test Email",
-        recipients=[
-            "vuyyalaharsha15@gmail.com"
-        ]
-    )
+    if not recipient:
+        return (
+            "Set TEST_EMAIL in Render Environment "
+            "before using this test route.",
+            400,
+        )
 
-    msg.body = """
-Hello!
+    try:
+        send_email(
+            subject="CampusPulse Test Email",
+            recipient=recipient,
+            text_body=(
+                "Hello!\\n\\n"
+                "This is a test email from CampusPulse.\\n\\n"
+                "CampusPulse Team"
+            ),
+        )
+    except Exception:
+        app.logger.exception("Test email sending failed")
+        return (
+            "Test email could not be sent. "
+            "Check Render logs and Resend configuration.",
+            502,
+        )
 
-This is a test email from CampusPulse.
-
-If you received this email,
-your Flask Mail configuration is working perfectly.
-
-CampusPulse Team
-"""
-
-    mail.send(
-        msg
-    )
-
-    return "Email Sent Successfully!"
+    return "Email sent successfully!"
 
 
 # ==========================================
